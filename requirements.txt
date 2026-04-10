@@ -1,0 +1,6 @@
+accelerate>=1.1.0
+huggingface_hub>=0.30.0
+optimum-quanto>=0.2.6
+safetensors>=0.4.5
+torch>=2.8.0
+transformers>=4.55.0,<4.56.0
