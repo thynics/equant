@@ -1,5 +1,0 @@
-Metadata-Version: 2.4
-Name: equant
-Version: 0.1.0
-Summary: KV-cache quantization latency benchmark workspace for Qwen models
-Requires-Python: >=3.9
