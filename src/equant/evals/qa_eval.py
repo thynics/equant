@@ -26,6 +26,7 @@ BOOL_TRUE = {"true", "yes"}
 BOOL_FALSE = {"false", "no"}
 DEFAULT_SYSTEM_PROMPT = "Answer using only the shortest possible final answer."
 QA_DATASETS = ["boolq", "squad", "coqa", "truthfulqa", "gsm8k"]
+SINGLE_LINE_DATASETS = {"boolq", "squad", "coqa", "truthfulqa"}
 
 
 def sanitize_model_id(model_id: str) -> str:
@@ -133,6 +134,28 @@ def extract_last_number(text: str) -> str | None:
     if not matches:
         return None
     return matches[-1].replace(",", "")
+
+
+def stop_strings_for_dataset(dataset_name: str) -> list[str]:
+    if dataset_name in SINGLE_LINE_DATASETS:
+        return ["\n", "\nQ:", "\nQuestion:"]
+    return []
+
+
+def should_stop_generation(tokenizer, generated_ids: list[int], stop_strings: list[str]) -> bool:
+    if not stop_strings or not generated_ids:
+        return False
+    text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    return any(stop_string in text for stop_string in stop_strings if stop_string)
+
+
+def clean_prediction_text(dataset_name: str, prediction: str) -> str:
+    cleaned = prediction.strip()
+    cleaned = re.sub(r"^\s*(?:assistant|answer)\s*:\s*", "", cleaned, flags=re.IGNORECASE)
+    if dataset_name in SINGLE_LINE_DATASETS:
+        cleaned = re.split(r"\n|(?:^|\s)(?:Q:|Question:)", cleaned, maxsplit=1)[0].strip()
+        cleaned = re.sub(r"^\s*A:\s*", "", cleaned, flags=re.IGNORECASE)
+    return cleaned
 
 
 def encode_prompt(tokenizer, prompt: str, *, use_chat_template: bool, system_prompt: str | None) -> list[int]:
@@ -344,6 +367,7 @@ def greedy_generate(
     model,
     tokenizer,
     *,
+    dataset_name: str,
     prompt_ids: list[int],
     cache_mode: str,
     device: torch.device,
@@ -376,6 +400,7 @@ def greedy_generate(
     next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
     eos_token_id = tokenizer.eos_token_id
     decode_step_latencies = []
+    stop_strings = stop_strings_for_dataset(dataset_name)
 
     for _ in range(answer_max_tokens):
         attention_mask = torch.cat(
@@ -403,9 +428,11 @@ def greedy_generate(
         next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
         if eos_token_id is not None and token_id == eos_token_id:
             break
+        if should_stop_generation(tokenizer, generated_ids, stop_strings):
+            break
 
     return {
-        "prediction": tokenizer.decode(generated_ids, skip_special_tokens=True).strip(),
+        "prediction": clean_prediction_text(dataset_name, tokenizer.decode(generated_ids, skip_special_tokens=True)),
         "prefill_latency_s": prefill_latency_s,
         "decode_latency_s": sum(decode_step_latencies),
         "decode_step_mean_ms": statistics.mean(decode_step_latencies) * 1000.0 if decode_step_latencies else 0.0,
@@ -505,6 +532,7 @@ def main() -> None:
                 generation = greedy_generate(
                     model,
                     tokenizer,
+                    dataset_name=dataset_name,
                     prompt_ids=prompt_ids,
                     cache_mode=cache_mode,
                     device=device,

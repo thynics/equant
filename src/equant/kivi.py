@@ -4,9 +4,8 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 from torch import nn
-from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, apply_rotary_pos_emb, repeat_kv
+from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, apply_rotary_pos_emb, eager_attention_forward
 
 
 def _safe_scale(mx: torch.Tensor, mn: torch.Tensor, bits: int) -> torch.Tensor:
@@ -162,6 +161,33 @@ class Qwen2AttentionKIVI(nn.Module):
     def _append_quantized_chunk(self, current: Optional[torch.Tensor], new_chunk: torch.Tensor, dim: int) -> torch.Tensor:
         return new_chunk if current is None else torch.cat([current, new_chunk], dim=dim)
 
+    def _resolve_attention_mask(
+        self,
+        *,
+        query_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        cache_position: Optional[torch.LongTensor],
+        key_length: int,
+    ) -> torch.Tensor:
+        if attention_mask is not None:
+            return attention_mask[:, :, :, :key_length]
+
+        if cache_position is None:
+            query_positions = torch.arange(query_states.shape[-2], device=query_states.device)
+        else:
+            query_positions = cache_position.to(query_states.device)
+
+        key_positions = torch.arange(key_length, device=query_states.device)
+        allowed = key_positions.unsqueeze(0) <= query_positions.unsqueeze(-1)
+        min_dtype = torch.finfo(query_states.dtype).min
+        causal_mask = torch.zeros(
+            (1, 1, query_positions.shape[0], key_length),
+            dtype=query_states.dtype,
+            device=query_states.device,
+        )
+        causal_mask = causal_mask.masked_fill(~allowed.unsqueeze(0).unsqueeze(0), min_dtype)
+        return causal_mask
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -193,13 +219,23 @@ class Qwen2AttentionKIVI(nn.Module):
 
         layer_state = past_key_value.layers[self.layer_idx]
         if layer_state.seq_length == 0:
-            attn_weights = torch.matmul(query_states, repeat_kv(key_states, self.num_key_value_groups).transpose(2, 3))
-            attn_weights = attn_weights * self.scaling
-            if attention_mask is not None:
-                attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            attn_weights = F.dropout(attn_weights, p=0.0 if not self.training else self.attention_dropout, training=self.training)
-            attn_output = torch.matmul(attn_weights, repeat_kv(value_states, self.num_key_value_groups))
+            resolved_attention_mask = self._resolve_attention_mask(
+                query_states=query_states,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+                key_length=key_states.shape[-2],
+            )
+            attn_output, _ = eager_attention_forward(
+                self.base_attn,
+                query_states,
+                key_states,
+                value_states,
+                resolved_attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                **kwargs,
+            )
 
             if key_states.shape[-2] < past_key_value.residual_length:
                 key_states_quant_trans = None
@@ -259,20 +295,8 @@ class Qwen2AttentionKIVI(nn.Module):
 
             key_states_full = key_states if layer_state.key_states_full is None else torch.cat([layer_state.key_states_full, key_states], dim=2)
 
-            if quant_key_states is not None:
-                quant_attn = torch.matmul(query_states, repeat_kv(quant_key_states, self.num_key_value_groups).transpose(2, 3))
-                full_attn = torch.matmul(query_states, repeat_kv(key_states_full, self.num_key_value_groups).transpose(2, 3))
-                attn_weights = torch.cat([quant_attn, full_attn], dim=-1)
-            else:
-                attn_weights = torch.matmul(query_states, repeat_kv(key_states_full, self.num_key_value_groups).transpose(2, 3))
-
-            attn_weights = attn_weights * self.scaling
-            if attention_mask is not None:
-                attn_weights = attn_weights + attention_mask[:, :, :, : attn_weights.shape[-1]]
-            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            attn_weights = F.dropout(attn_weights, p=0.0 if not self.training else self.attention_dropout, training=self.training)
-
             value_states_full = value_states if layer_state.value_states_full is None else torch.cat([layer_state.value_states_full, value_states], dim=2)
+            quant_value_states = None
             if layer_state.value_states_quant is not None:
                 quant_value_states = dequantize_value_cache(
                     layer_state.value_states_quant,
@@ -281,17 +305,26 @@ class Qwen2AttentionKIVI(nn.Module):
                     group_size=past_key_value.group_size,
                     bits=past_key_value.v_bits,
                 )
-                full_len = value_states_full.shape[-2]
-                attn_output = torch.matmul(
-                    attn_weights[:, :, :, :-full_len],
-                    repeat_kv(quant_value_states, self.num_key_value_groups),
-                )
-                attn_output = attn_output + torch.matmul(
-                    attn_weights[:, :, :, -full_len:],
-                    repeat_kv(value_states_full, self.num_key_value_groups),
-                )
-            else:
-                attn_output = torch.matmul(attn_weights, repeat_kv(value_states_full, self.num_key_value_groups))
+
+            all_key_states = key_states_full if quant_key_states is None else torch.cat([quant_key_states, key_states_full], dim=2)
+            all_value_states = value_states_full if quant_value_states is None else torch.cat([quant_value_states, value_states_full], dim=2)
+            resolved_attention_mask = self._resolve_attention_mask(
+                query_states=query_states,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+                key_length=all_key_states.shape[-2],
+            )
+            attn_output, _ = eager_attention_forward(
+                self.base_attn,
+                query_states,
+                all_key_states,
+                all_value_states,
+                resolved_attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                **kwargs,
+            )
 
             if key_states_full is not None and key_states_full.shape[-2] == past_key_value.residual_length:
                 quant_chunk, scale_chunk, mn_chunk = quantize_key_cache(
@@ -320,7 +353,6 @@ class Qwen2AttentionKIVI(nn.Module):
             layer_state.value_states_full = value_states_full
             layer_state.seq_length += key_states.shape[-2]
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.base_attn.o_proj(attn_output)
         return attn_output, None
