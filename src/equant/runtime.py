@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from typing import Optional
 
 import torch
@@ -7,7 +8,8 @@ import torch
 
 def auto_device() -> torch.device:
     if torch.cuda.is_available():
-        return torch.device("cuda")
+        cuda_index = torch.cuda.device_count() - 1
+        return torch.device("cuda", cuda_index)
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
@@ -45,3 +47,25 @@ def dtype_name(dtype_or_auto) -> str:
     if isinstance(dtype_or_auto, str):
         return dtype_or_auto
     return str(dtype_or_auto).replace("torch.", "")
+
+
+def build_model_inputs(
+    model,
+    *,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    past_key_values,
+    use_cache: bool,
+    cache_position: Optional[torch.Tensor] = None,
+) -> dict:
+    kwargs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "past_key_values": past_key_values,
+        "use_cache": use_cache,
+    }
+    if cache_position is not None:
+        signature = inspect.signature(model.forward)
+        if "cache_position" in signature.parameters:
+            kwargs["cache_position"] = cache_position
+    return kwargs

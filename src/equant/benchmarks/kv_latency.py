@@ -12,8 +12,9 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from equant.cache_factories import make_cache
-from equant.model_assets import ensure_qwen_assets
-from equant.runtime import dtype_name, parse_device, resolve_torch_dtype, synchronize
+from equant.kivi import patch_model_for_kivi
+from equant.model_assets import ensure_model_assets
+from equant.runtime import build_model_inputs, dtype_name, parse_device, resolve_torch_dtype, synchronize
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -73,7 +74,7 @@ def build_input_ids(tokenizer, prompt_length: int, batch_size: int, prompt_templ
     return input_ids, attention_mask
 
 
-def load_model(model_path: str, device: torch.device, torch_dtype_arg):
+def load_model(model_path: str, device: torch.device, torch_dtype_arg, cache_modes: list[str]):
     load_kwargs = {
         "low_cpu_mem_usage": True,
         "trust_remote_code": False,
@@ -81,6 +82,8 @@ def load_model(model_path: str, device: torch.device, torch_dtype_arg):
     }
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
     model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+    if any(cache_mode.lower().startswith("kivi-int") for cache_mode in cache_modes):
+        patch_model_for_kivi(model)
     model.eval()
     model.to(device)
     return model, tokenizer
@@ -104,11 +107,14 @@ def run_single_trial(
     synchronize(device)
     prefill_start = time.perf_counter()
     outputs = model(
-        input_ids=input_ids,
-        attention_mask=running_attention_mask,
-        cache_position=cache_position,
-        past_key_values=cache,
-        use_cache=True,
+        **build_model_inputs(
+            model,
+            input_ids=input_ids,
+            attention_mask=running_attention_mask,
+            cache_position=cache_position,
+            past_key_values=cache,
+            use_cache=True,
+        ),
     )
     synchronize(device)
     prefill_latency_s = time.perf_counter() - prefill_start
@@ -131,11 +137,14 @@ def run_single_trial(
         synchronize(device)
         decode_step_start = time.perf_counter()
         outputs = model(
-            input_ids=next_token,
-            attention_mask=running_attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            use_cache=True,
+            **build_model_inputs(
+                model,
+                input_ids=next_token,
+                attention_mask=running_attention_mask,
+                cache_position=cache_position,
+                past_key_values=past_key_values,
+                use_cache=True,
+            ),
         )
         synchronize(device)
         decode_step_latencies.append(time.perf_counter() - decode_step_start)
@@ -205,7 +214,7 @@ def main() -> None:
     torch_dtype_arg = resolve_torch_dtype(args.torch_dtype)
     ensure_runtime_feasibility(device, args.prompt_length, args.max_new_tokens)
 
-    asset_paths = ensure_qwen_assets(
+    asset_paths = ensure_model_assets(
         model_id=args.model_id,
         model_dir=Path(args.model_dir),
         vendor_code_dir=Path(args.vendor_code_dir),
@@ -216,7 +225,7 @@ def main() -> None:
         export_code_if_missing=True,
     )
 
-    model, tokenizer = load_model(str(asset_paths.model_dir), device, torch_dtype_arg)
+    model, tokenizer = load_model(str(asset_paths.model_dir), device, torch_dtype_arg, args.cache)
     input_ids, attention_mask = build_input_ids(
         tokenizer=tokenizer,
         prompt_length=args.prompt_length,

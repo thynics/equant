@@ -1,4 +1,5 @@
 accelerate>=1.1.0
+datasets>=3.0.0
 huggingface_hub>=0.30.0
 optimum-quanto>=0.2.6
 safetensors>=0.4.5
