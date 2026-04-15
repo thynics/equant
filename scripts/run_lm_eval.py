@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -12,16 +14,12 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from equant.evals.qa_eval import sanitize_model_id
-from equant.model_assets import ensure_model_assets
-from equant.runtime import parse_device
-
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run EleutherAI LM Evaluation Harness with the official HuggingFace backend "
-            "against a locally prepared model snapshot."
+            "Run EleutherAI LM Evaluation Harness against a locally prepared model snapshot, "
+            "with optional equant cache modes such as KIVI."
         )
     )
     parser.add_argument("--model-id", default="Qwen/Qwen2.5-14B")
@@ -38,20 +36,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--tasks",
         nargs="+",
         default=["truthfulqa_gen", "gsm8k"],
-        help="LM-Eval task names. Use 'python -m lm_eval --help' or 'python -m lm_eval ls tasks' after installation to inspect availability.",
+        help="LM-Eval task names. Use '--list-tasks' after installation to inspect availability.",
     )
     parser.add_argument("--device", default=None)
+    parser.add_argument("--torch-dtype", default="auto")
+    parser.add_argument("--cache-mode", default="dynamic")
     parser.add_argument("--batch-size", default="auto")
     parser.add_argument("--num-fewshot", type=int, default=None)
     parser.add_argument("--limit", type=float, default=None)
     parser.add_argument("--output-path", default=None)
     parser.add_argument("--use-cache", default=None)
     parser.add_argument("--log-samples", action="store_true")
-    parser.add_argument(
-        "--model-args-extra",
-        default=None,
-        help="Extra lm-eval --model_args entries, appended verbatim, e.g. 'parallelize=True,max_memory_per_gpu=70GiB'.",
-    )
+    parser.add_argument("--apply-chat-template", action="store_true")
+    parser.add_argument("--gen-kwargs", default=None)
+    parser.add_argument("--residual-length", type=int, default=128)
+    parser.add_argument("--q-group-size", type=int, default=64)
     parser.add_argument(
         "--list-tasks",
         action="store_true",
@@ -67,13 +66,45 @@ def ensure_lm_eval_installed() -> None:
         )
 
 
+def resolve_output_path(output_path: str | None) -> Path | None:
+    if output_path is None:
+        return None
+
+    path = Path(output_path)
+    if path.suffix:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    path.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return path / f"lm_eval_{timestamp}.json"
+
+
+def write_results(results, output_path: Path) -> None:
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(results, handle, ensure_ascii=False, indent=2, default=str)
+        handle.write("\n")
+
+
 def main() -> None:
     args = build_parser().parse_args()
-    ensure_lm_eval_installed()
-
     if args.list_tasks:
+        ensure_lm_eval_installed()
         subprocess.run([sys.executable, "-m", "lm_eval", "ls", "tasks"], check=True)
         return
+
+    from equant.cache_factories import parse_cache_descriptor
+    from equant.evals.qa_eval import load_model, sanitize_model_id
+    from equant.model_assets import ensure_model_assets
+    from equant.runtime import parse_device, resolve_torch_dtype
+
+    parse_cache_descriptor(args.cache_mode)
+    ensure_lm_eval_installed()
+
+    from lm_eval.evaluator import simple_evaluate
+    from lm_eval.utils import make_table
+
+    from equant.evals.lm_eval_backend import EquantHFLM
 
     sanitized_model_id = sanitize_model_id(args.model_id)
     model_dir = Path(args.model_dir) if args.model_dir else REPO_ROOT / "artifacts" / "models" / sanitized_model_id
@@ -90,43 +121,50 @@ def main() -> None:
         export_code_if_missing=False,
     )
 
-    resolved_device = str(parse_device(args.device))
-    model_args = [
-        f"pretrained={model_dir.resolve()}",
-        "trust_remote_code=False",
-    ]
-    if args.revision is not None:
-        model_args.append(f"revision={args.revision}")
-    if args.model_args_extra:
-        model_args.append(args.model_args_extra)
+    device = parse_device(args.device)
+    torch_dtype = resolve_torch_dtype(args.torch_dtype)
+    model, tokenizer = load_model(str(model_dir.resolve()), device, torch_dtype, [args.cache_mode])
+    lm = EquantHFLM(
+        pretrained=model,
+        tokenizer=tokenizer,
+        batch_size=args.batch_size,
+        device=str(device),
+        cache_mode=args.cache_mode,
+        residual_length=args.residual_length,
+        q_group_size=args.q_group_size,
+    )
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "lm_eval",
-        "--model",
-        "hf",
-        "--model_args",
-        ",".join(model_args),
-        "--tasks",
-        ",".join(args.tasks),
-        "--device",
-        resolved_device,
-        "--batch_size",
-        str(args.batch_size),
-    ]
-    if args.num_fewshot is not None:
-        cmd.extend(["--num_fewshot", str(args.num_fewshot)])
-    if args.limit is not None:
-        cmd.extend(["--limit", str(args.limit)])
-    if args.output_path is not None:
-        cmd.extend(["--output_path", args.output_path])
-    if args.use_cache is not None:
-        cmd.extend(["--use_cache", args.use_cache])
-    if args.log_samples:
-        cmd.append("--log_samples")
+    results = simple_evaluate(
+        model=lm,
+        tasks=args.tasks,
+        num_fewshot=args.num_fewshot,
+        batch_size=args.batch_size,
+        device=str(device),
+        use_cache=args.use_cache,
+        limit=args.limit,
+        log_samples=args.log_samples,
+        apply_chat_template=args.apply_chat_template,
+        gen_kwargs=args.gen_kwargs,
+    )
+    if results is None:
+        return
 
-    subprocess.run(cmd, check=True)
+    results.setdefault("config", {})
+    results["config"].update(
+        {
+            "model_id": args.model_id,
+            "cache_mode": args.cache_mode,
+            "torch_dtype": args.torch_dtype,
+            "residual_length": args.residual_length,
+            "q_group_size": args.q_group_size,
+        }
+    )
+
+    print(make_table(results))
+    output_path = resolve_output_path(args.output_path)
+    if output_path is not None:
+        write_results(results, output_path)
+        print(f"results_path={output_path}")
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@
 - `scripts/prepare_model_assets.py`: 下载或续传一个开源模型到本地
 - `scripts/prepare_qwen_assets.py`: 向后兼容的 Qwen 资产准备脚本
 - `scripts/run_qa_eval.py`: 运行开源 QA 数据集评测并输出分数
-- `scripts/run_lm_eval.py`: 用 EleutherAI LM Evaluation Harness 的官方 HuggingFace backend 评测本地模型
+- `scripts/run_lm_eval.py`: 用 EleutherAI LM Evaluation Harness 评测本地模型，并可切到 `kivi/quanto` cache mode
 - `scripts/run_kivi_qa_compare.py`: 用论文风格默认参数对比 Qwen BF16 和 KIVI-2 在 CoQA / TruthfulQA / GSM8K 上的分数
 - `scripts/run_kv_bench.py`: 运行 KV cache latency benchmark
 - `scripts/run_long_context_eval.py`: 运行一个最小的官方 LongBench-E 子集
@@ -113,14 +113,14 @@ python scripts/prepare_model_assets.py \
 
 ## LM-Eval 集成
 
-仓库现在提供了一个对 `lm-evaluation-harness` 的轻量集成脚本，先走官方 `hf` backend：
+仓库现在提供了一个对 `lm-evaluation-harness` 的轻量集成脚本：
 
 ```bash
 .venv/bin/pip install -r requirements.lm_eval.txt
 .venv/bin/python scripts/run_lm_eval.py --list-tasks
 ```
 
-例如，用本地 Qwen2.5-14B 跑 `truthfulqa_gen` 和 `gsm8k`：
+例如，用本地 Qwen2.5-14B 跑 BF16 baseline：
 
 ```bash
 .venv/bin/python scripts/run_lm_eval.py \
@@ -129,17 +129,29 @@ python scripts/prepare_model_assets.py \
   --batch-size auto
 ```
 
+如果你要直接把 `kivi-int2` 接进 `lm-eval`，可以这样跑：
+
+```bash
+.venv/bin/python scripts/run_lm_eval.py \
+  --model-id Qwen/Qwen2.5-14B \
+  --cache-mode kivi-int2 \
+  --residual-length 128 \
+  --q-group-size 32 \
+  --tasks truthfulqa_gen gsm8k \
+  --batch-size auto
+```
+
 这个脚本会：
 
 - 默认复用仓库里已经准备好的本地模型目录
 - 默认沿用本仓库的设备选择逻辑；多卡 CUDA 时默认落到最后一张卡
-- 直接调用 `python -m lm_eval --model hf ...`
+- 对 `dynamic` 走 `lm-eval` 的 HuggingFace wrapper
+- 对 `kivi/quanto/hqq` 走仓库自己的预加载模型 + cache factory
 
 当前限制：
 
-- 这一版集成的是 `lm-eval` 官方 `hf` backend，所以默认跑的是 BF16 / HF baseline
-- `kivi-int2` / `quanto-int4` 这种自定义 cache 还没有直接注入到 `lm-eval` 内部
-- 如果要把 `kivi` 也完整接到 `lm-eval`，下一步需要实现一个自定义 `lm_eval` model backend 或本地 OpenAI-compatible inference server
+- `cache-mode != dynamic` 这一支目前只支持 `generate_until` 任务
+- 也就是说，`truthfulqa_gen`、`gsm8k` 这类生成式任务可以直接跑；依赖 `loglikelihood` 的任务暂时还不支持 `kivi/quanto`
 
 ## 最小长上下文打分
 
