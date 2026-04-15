@@ -17,6 +17,7 @@
 - `scripts/prepare_model_assets.py`: 下载或续传一个开源模型到本地
 - `scripts/prepare_qwen_assets.py`: 向后兼容的 Qwen 资产准备脚本
 - `scripts/run_qa_eval.py`: 运行开源 QA 数据集评测并输出分数
+- `scripts/run_kivi_qa_compare.py`: 用论文风格默认参数对比 Qwen BF16 和 KIVI-2 在 CoQA / TruthfulQA / GSM8K 上的分数
 - `scripts/run_kv_bench.py`: 运行 KV cache latency benchmark
 - `scripts/run_long_context_eval.py`: 运行一个最小的官方 LongBench-E 子集
 - `src/equant/benchmarks/kv_latency.py`: benchmark 主逻辑
@@ -58,6 +59,41 @@ python scripts/run_qa_eval.py \
 - `coqa`: F1 / exact match
 - `truthfulqa`: F1 / exact match against truthful reference answers
 - `gsm8k`: final numeric answer accuracy
+
+如果你想直接跑一个固定配置的 `BF16 vs KIVI-2` 对比脚本，仓库也提供了：
+
+```bash
+python scripts/run_kivi_qa_compare.py \
+  --model-id Qwen/Qwen2.5-14B \
+  --use-chat-template
+```
+
+这个脚本默认：
+
+- baseline: `dynamic`，即 Qwen BF16
+- KIVI: `kivi-int2`
+- datasets: `coqa truthfulqa gsm8k`
+- `q_group_size=32`
+- `residual_length=128`
+- 默认假设模型已经下载好，并自动加 `--no-download`
+
+如果你要切到论文附录补充设置，可以传：
+
+```bash
+python scripts/run_kivi_qa_compare.py \
+  --model-id Qwen/Qwen2.5-14B \
+  --residual-length 32 \
+  --use-chat-template
+```
+
+如果你确实希望缺模型时自动下载，再显式加：
+
+```bash
+python scripts/run_kivi_qa_compare.py \
+  --model-id Qwen/Qwen2.5-14B \
+  --download \
+  --use-chat-template
+```
 
 ## 模型下载与部署
 
