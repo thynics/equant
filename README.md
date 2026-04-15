@@ -51,10 +51,13 @@ python scripts/run_qa_eval.py \
 
 第一次运行时，如果本地模型缺失或只有半截下载，脚本会自动拉取或续传。评测结果会写到 `results/qa_eval_<timestamp>.jsonl`，终端会按 `dataset x cache_mode` 输出聚合分数。
 
-当前内置了两个开源 QA 数据集：
+当前内置了五个开源 QA 数据集：
 
 - `boolq`: accuracy
 - `squad`: F1 / exact match
+- `coqa`: F1 / exact match
+- `truthfulqa`: F1 / exact match against truthful reference answers
+- `gsm8k`: final numeric answer accuracy
 
 ## 模型下载与部署
 

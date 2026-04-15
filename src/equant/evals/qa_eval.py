@@ -25,6 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 BOOL_TRUE = {"true", "yes"}
 BOOL_FALSE = {"false", "no"}
 DEFAULT_SYSTEM_PROMPT = "Answer using only the shortest possible final answer."
+QA_DATASETS = ["boolq", "squad", "coqa", "truthfulqa", "gsm8k"]
 
 
 def sanitize_model_id(model_id: str) -> str:
@@ -43,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default=None)
     parser.add_argument("--torch-dtype", default="auto")
     parser.add_argument("--cache", nargs="+", default=["dynamic", "kivi-int2", "quanto-int4"])
-    parser.add_argument("--datasets", nargs="+", default=["boolq", "squad"], choices=["boolq", "squad"])
+    parser.add_argument("--datasets", nargs="+", default=["boolq", "squad"], choices=QA_DATASETS)
     parser.add_argument("--max-samples-per-dataset", type=int, default=32)
     parser.add_argument("--max-answer-tokens", type=int, default=32)
     parser.add_argument("--residual-length", type=int, default=128)
@@ -115,6 +116,25 @@ def parse_bool_prediction(text: str) -> bool | None:
     return None
 
 
+def dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen = set()
+    result = []
+    for value in values:
+        normalized = normalize_answer(value)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(value)
+    return result
+
+
+def extract_last_number(text: str) -> str | None:
+    matches = re.findall(r"-?\d[\d,]*(?:\.\d+)?", text.replace("$", ""))
+    if not matches:
+        return None
+    return matches[-1].replace(",", "")
+
+
 def encode_prompt(tokenizer, prompt: str, *, use_chat_template: bool, system_prompt: str | None) -> list[int]:
     if use_chat_template and getattr(tokenizer, "chat_template", None):
         messages = []
@@ -177,9 +197,96 @@ def load_squad_records(max_samples: int, seed: int):
     return sample_records(records, max_samples=max_samples, seed=seed)
 
 
+def load_coqa_records(max_samples: int, seed: int):
+    from datasets import load_dataset
+
+    dataset = load_dataset("coqa", split="validation")
+    records = []
+    for story_index in range(len(dataset)):
+        row = dataset[story_index]
+        story = row["story"]
+        history_lines = []
+        for turn_index, question in enumerate(row["questions"]):
+            answer = row["answers"]["input_text"][turn_index]
+            prompt_parts = [
+                "Read the story and answer the conversational question.",
+                "",
+                f"Story:\n{story}",
+            ]
+            if history_lines:
+                prompt_parts.extend(["", "Conversation so far:", "\n".join(history_lines)])
+            prompt_parts.extend(["", f"Question: {question}", "Answer: "])
+            records.append(
+                {
+                    "sample_id": f"{story_index}-{turn_index}",
+                    "prompt": "\n".join(prompt_parts),
+                    "answers": [answer],
+                    "dataset": "coqa",
+                    "metric_name": "f1",
+                }
+            )
+            history_lines.append(f"Q: {question}\nA: {answer}")
+    return sample_records(records, max_samples=max_samples, seed=seed)
+
+
+def load_truthfulqa_records(max_samples: int, seed: int):
+    from datasets import load_dataset
+
+    dataset = load_dataset("truthful_qa", "generation", split="validation")
+    records = []
+    for index in range(len(dataset)):
+        row = dataset[index]
+        prompt = (
+            "Answer the question truthfully and concisely.\n\n"
+            f"Question: {row['question']}\n"
+            "Answer: "
+        )
+        answers = dedupe_preserve_order([row["best_answer"], *row["correct_answers"]])
+        records.append(
+            {
+                "sample_id": index,
+                "prompt": prompt,
+                "answers": answers,
+                "dataset": "truthfulqa",
+                "metric_name": "f1",
+            }
+        )
+    return sample_records(records, max_samples=max_samples, seed=seed)
+
+
+def load_gsm8k_records(max_samples: int, seed: int):
+    from datasets import load_dataset
+
+    dataset = load_dataset("gsm8k", "main", split="test")
+    records = []
+    for index in range(len(dataset)):
+        row = dataset[index]
+        final_answer = extract_last_number(row["answer"])
+        if final_answer is None:
+            continue
+        prompt = (
+            "Solve the math word problem. Respond with only the final numeric answer.\n\n"
+            f"Question: {row['question']}\n"
+            "Answer: "
+        )
+        records.append(
+            {
+                "sample_id": index,
+                "prompt": prompt,
+                "answers": [final_answer],
+                "dataset": "gsm8k",
+                "metric_name": "accuracy",
+            }
+        )
+    return sample_records(records, max_samples=max_samples, seed=seed)
+
+
 DATASET_LOADERS = {
     "boolq": load_boolq_records,
     "squad": load_squad_records,
+    "coqa": load_coqa_records,
+    "truthfulqa": load_truthfulqa_records,
+    "gsm8k": load_gsm8k_records,
 }
 
 
@@ -200,6 +307,33 @@ def score_prediction(dataset_name: str, prediction: str, answers: list[str]) -> 
             "primary_score": f1,
             "exact_match": exact_match,
             "f1": f1,
+        }
+
+    if dataset_name == "coqa":
+        exact_match = max(exact_match_score(prediction, answer) for answer in answers)
+        f1 = max(token_f1_score(prediction, answer) for answer in answers)
+        return {
+            "primary_score": f1,
+            "exact_match": exact_match,
+            "f1": f1,
+        }
+
+    if dataset_name == "truthfulqa":
+        exact_match = max(exact_match_score(prediction, answer) for answer in answers)
+        f1 = max(token_f1_score(prediction, answer) for answer in answers)
+        return {
+            "primary_score": f1,
+            "exact_match": exact_match,
+            "f1": f1,
+        }
+
+    if dataset_name == "gsm8k":
+        prediction_number = extract_last_number(prediction)
+        accuracy = float(prediction_number is not None and prediction_number == answers[0])
+        return {
+            "primary_score": accuracy,
+            "accuracy": accuracy,
+            "prediction_number": prediction_number,
         }
 
     raise ValueError(f"Unsupported dataset: {dataset_name}")
@@ -293,7 +427,7 @@ def print_summary(rows: list[dict]) -> None:
     print("-" * len(header))
     for (dataset_name, cache_mode), group_rows in sorted(grouped.items()):
         samples = len(group_rows)
-        if dataset_name == "boolq":
+        if dataset_name in {"boolq", "gsm8k"}:
             accuracy = 100.0 * sum(row["accuracy"] for row in group_rows) / samples
             extra = f"acc={accuracy:.2f}"
             primary = accuracy
